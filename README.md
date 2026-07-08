@@ -5,7 +5,8 @@
 # sandpod
 
 Run AI coding agents (Claude Code, Codex, etc.) inside a hardened, rootless
-Podman sandbox on macOS.
+Podman sandbox. Runs on macOS and Linux (Linux support is new and only
+partially verified — see "Prerequisites" for the specific open gap).
 
 ## Install
 
@@ -13,13 +14,14 @@ Podman sandbox on macOS.
 curl -fsSL https://raw.githubusercontent.com/stefan-theusner/silenceapi-sandpod/main/install.sh | bash
 ```
 
-This clones sandpod to `~/.sandpod`, installs Podman via Homebrew if it's
-missing, sets up a podman machine if you don't have one, builds the sandbox
-image, and links the `sandpod` command into `/usr/local/bin` (or prints a
-`PATH` line to add yourself if that's not writable). Safe to re-run later —
-it updates the existing clone and rebuilds instead of reinstalling from
-scratch. See "Prerequisites" below if you'd rather do each step by hand, or
-`install.sh` itself for exactly what it runs.
+This clones sandpod to `~/.sandpod`, installs Podman if it's missing
+(Homebrew + a podman machine VM on macOS; your distro's package manager,
+no VM needed, on Linux), builds the sandbox image, and links the `sandpod`
+command into `/usr/local/bin` (or prints a `PATH` line to add yourself if
+that's not writable). Safe to re-run later — it updates the existing clone
+and rebuilds instead of reinstalling from scratch. See "Prerequisites"
+below if you'd rather do each step by hand, or `install.sh` itself for
+exactly what it runs.
 
 ## How it works
 
@@ -59,9 +61,8 @@ reviewing ordinary file edits.
 This design went through several iterations — a copy-on-write overlay
 mount, then a volume-copy-plus-manual-sync workflow, then a live
 bind-mount with `/dev/null`/empty-dir masking that turned out unable to
-protect a file created while a session was already open. See
-`/Users/theusi/.claude/plans/i-want-to-use-jolly-plum.md` for the full
-history if you're curious why each of those didn't stick.
+protect a file created while a session was already open — before landing
+on the live FUSE shadow filesystem described above.
 
 ### Privilege model
 
@@ -79,6 +80,11 @@ or the agent.
 
 ## Prerequisites
 
+The [install script](#install) above handles all of this for you; the
+following is what it does, for reference or if you'd rather do it by hand.
+
+### macOS
+
 ```sh
 brew install podman
 podman machine init --provider applehv
@@ -94,20 +100,43 @@ The default machine virtiofs-shares your home directory, so projects under
 recreate the machine with `podman machine init --provider applehv --volume
 <path>` (Podman can't add mounts to an existing machine).
 
-This `applehv` machine runs an SELinux-enforcing VM. Named volumes (like
-`sandpod-agent-home`) need the `:z` mount flag (already set in
+Podman's macOS machine runs an SELinux-enforcing internal VM. Named volumes
+(like `sandpod-agent-home`) need the `:z` mount flag (already set in
 `bin/sandpod`) or newly-written executables inside them fail with
 `Permission denied` even though the Unix permission bits look correct —
 SELinux denies the exec, not the filesystem. You shouldn't need to do
 anything about this yourself; it's noted here in case you extend `sandpod`
 and hit the same surprise.
 
-Add this repo's `bin/` to your `PATH` so you can run `sandpod` from
-anywhere:
+### Linux
 
 ```sh
-export PATH="/Users/theusi/Development/ext/sand-pod/bin:$PATH"
+sudo apt-get install podman   # or: sudo dnf install podman
 ```
+
+No VM/machine step — Podman runs natively on the host kernel, so any host
+path is directly bind-mountable (no `$HOME`-only restriction the way
+macOS's virtiofs sharing has). Whether `:z` matters depends on whether
+*this* host runs SELinux (Fedora/RHEL) or not (Ubuntu/Debian's AppArmor,
+where it's a documented no-op) — either way there's nothing you need to
+configure for it.
+
+**Unverified:** `sandpod` needs `CAP_SYS_ADMIN` and `/dev/fuse` to mount its
+shadow filesystem. This is confirmed working inside Podman's own (rootless)
+Linux VM on macOS, but real Linux distros vary in how they gate `/dev/fuse`
+for rootless containers, and this hasn't been tested against an actual
+Linux host yet. If `sandpod shell`/`run` fails to mount `/workspace`, that's
+this open gap, not a configuration mistake to chase — please report the
+exact error if you hit it.
+
+### Adding sandpod to your PATH
+
+```sh
+export PATH="$HOME/.sandpod/bin:$PATH"
+```
+
+(adjust the path if you set `SANDPOD_INSTALL_DIR` to something else when
+installing).
 
 ## Build the image
 
