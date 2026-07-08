@@ -5,14 +5,18 @@
 # sandpod
 
 Run AI coding agents (Claude Code, Codex, etc.) inside a hardened, rootless
-Podman sandbox. Runs on macOS and Linux (Linux support is new and only
-partially verified — see "Prerequisites" for the specific open gap).
+Podman sandbox. Runs on macOS and Linux, and on Windows via WSL2 (Linux and
+WSL2 support are new and only partially verified — see "Prerequisites" for
+the specific open gap).
 
 ## Install
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/stefan-theusner/silenceapi-sandpod/main/install.sh | bash
 ```
+
+On Windows, run this from inside a WSL2 distro's shell (e.g. Ubuntu), not
+PowerShell/cmd — see "Windows (via WSL2)" under Prerequisites.
 
 This clones sandpod to `~/.sandpod`, installs Podman if it's missing
 (Homebrew + a podman machine VM on macOS; your distro's package manager,
@@ -128,6 +132,30 @@ for rootless containers, and this hasn't been tested against an actual
 Linux host yet. If `sandpod shell`/`run` fails to mount `/workspace`, that's
 this open gap, not a configuration mistake to chase — please report the
 exact error if you hit it.
+
+### Windows (via WSL2)
+
+There's no native Windows support — `sandpod` and `install.sh` are bash,
+and the whole design assumes a Linux container backend. The supported path
+is running entirely from inside WSL2, which is a real Linux kernel:
+
+```sh
+wsl --install -d Ubuntu   # from an elevated PowerShell/cmd, if you don't have WSL2 yet
+```
+
+Then open that Ubuntu shell and just follow the **Linux** instructions
+above — `uname -s` reports plain `Linux` under WSL2, so `install.sh`
+handles it identically to bare-metal Linux, no special casing needed. Two
+WSL-specific things worth knowing (the installer prints a reminder of both
+if it detects WSL2):
+
+- **Keep your projects inside the WSL filesystem** (e.g. `~/projects/...`)
+  rather than a Windows path under `/mnt/c/...` — cross-boundary access
+  works, but is slower.
+- The FUSE-mounting gap noted above for Linux applies here too, possibly
+  more so — WSL2's kernel is Microsoft-maintained and distinct from a
+  regular distro's, so it's its own unverified case, not automatically
+  covered by testing on bare-metal Linux.
 
 ### Adding sandpod to your PATH
 

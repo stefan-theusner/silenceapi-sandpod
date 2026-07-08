@@ -10,10 +10,17 @@
 # Podman runs natively there), builds the sandbox image, and links the
 # `sandpod` command onto your PATH.
 #
-# Linux note: FUSE-mounting under a distro's default (usually rootless)
-# Podman setup hasn't been verified across distros yet - if `sandpod
-# shell`/`run` fails to mount /workspace, that's the current known gap,
-# not something this installer can detect or work around for you.
+# Windows: run this from inside a WSL2 distro (e.g. Ubuntu), not from
+# PowerShell/cmd - WSL2 is a real Linux kernel and reports as plain "Linux",
+# so it's handled identically to bare-metal Linux below. There's no native
+# (non-WSL) Windows support - this is a bash script and the whole tool
+# assumes a Linux container backend.
+#
+# Linux note (WSL2 included): FUSE-mounting under a distro's default
+# (usually rootless) Podman setup hasn't been verified across
+# distros/kernels yet - if `sandpod shell`/`run` fails to mount /workspace,
+# that's the current known gap, not something this installer can detect or
+# work around for you.
 #
 # Env vars:
 #   SANDPOD_INSTALL_DIR  where to clone the repo (default: $HOME/.sandpod)
@@ -31,8 +38,22 @@ die() { echo "sandpod install: $*" >&2; exit 1; }
 OS="$(uname -s)"
 case "$OS" in
   Darwin|Linux) ;;
-  *) die "unsupported OS '$OS' - sandpod supports macOS and Linux" ;;
+  *) die "unsupported OS '$OS' - sandpod supports macOS and Linux (Windows via WSL2, which reports as Linux)" ;;
 esac
+
+# WSL2 reports uname -s as plain "Linux", so it already takes the Linux
+# branch below with no special-casing needed - Windows support IS Linux
+# support, run from inside a WSL2 distro. This is purely an informational
+# note for two WSL-specific gotchas that don't apply to bare-metal Linux.
+if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+  log "Detected WSL2 (${WSL_DISTRO_NAME:-unknown distro}) - two things worth knowing:"
+  log "  1. For best performance/reliability, keep projects inside the WSL"
+  log "     filesystem (e.g. ~/projects/...) rather than a Windows path under"
+  log "     /mnt/c/... - cross-boundary access works but is slower."
+  log "  2. FUSE-mounting under WSL2's kernel is unverified, same open gap"
+  log "     as bare-metal Linux (see README) - possibly more so, since WSL2's"
+  log "     kernel has its own quirks distinct from a real Linux distro's."
+fi
 
 command -v git >/dev/null 2>&1 || die "git is required$([ "$OS" = Darwin ] && echo " (run 'xcode-select --install' first)")"
 
