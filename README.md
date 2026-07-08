@@ -1,3 +1,7 @@
+<p align="center" style="">
+  <img src="sandpod.png" />
+</p>
+
 # sandpod
 
 Run AI coding agents (Claude Code, Codex, etc.) inside a hardened, rootless
