@@ -186,6 +186,7 @@ sandpod init             # create a .sandignore for this project (optional)
 sandpod shell             # interactive shell in the sandbox
 sandpod run claude        # run Claude Code directly
 sandpod run codex         # run Codex CLI directly (once installed in the image)
+sandpod launch claude     # alias for `run` - same thing, reads better for agents
 sandpod remove            # stop and remove this project's sandbox container
 sandpod list              # see every project that currently has a sandbox
 sandpod config ls         # show the merged ignore list and what it masks
