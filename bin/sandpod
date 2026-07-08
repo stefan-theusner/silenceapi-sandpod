@@ -15,8 +15,21 @@
 # Run `sandpod help` for usage.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve our own real path through any symlinks (e.g. install.sh links
+# /usr/local/bin/sandpod -> <repo>/bin/sandpod) so REPO_DIR points at the
+# actual repo regardless of how this script was invoked.
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in
+    /*) ;;
+    *) _src="$_dir/$_src" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+unset _src _dir
 
 IMAGE="${SANDPOD_IMAGE:-sandpod}"
 MEM="${SANDPOD_MEM:-4g}"
