@@ -1,0 +1,24 @@
+# Default shadow list for sandpod. Strict subset of .gitignore syntax
+# (see fuse/rules.go): *, ?, [abc], ** all work; a bare name matches at any
+# depth; a leading/mid "/" anchors to the project root; a trailing "/"
+# restricts to directories; "!" negation is not supported. Enforced live by
+# sandpod-fuse - a path here is hidden from the sandbox the instant the
+# container exists, whether or not the path itself exists yet.
+# Lines starting with "#" and blank lines are ignored.
+# Merge with a project-local .sandignore in the project root for extra entries.
+
+.ssh/
+.aws/
+.gnupg/
+.netrc
+.npmrc
+.git-credentials
+.env
+.env.*
+credentials.json
+*.pem
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+node_modules/

@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# sandpod: run AI coding agents (Claude Code, Codex, etc.) inside a
+# hardened Podman sandbox, one persistent container per project directory.
+#
+# The project directory is bind-mounted directly (read-write) - there's
+# only one copy of your files, so host and container stay in sync
+# automatically, live, both directions. Secrets/build-artifacts
+# (config/global.sandignore plus an optional project-local .sandignore)
+# are hidden from the container's view by a live FUSE shadow filesystem
+# (sandpod-fuse, vendored from claude-container/rp-fuse) - masking is
+# enforced on every file access, not resolved once at container-creation
+# time, so a file created mid-session is masked instantly, the same as one
+# that already existed.
+#
+# Run `sandpod help` for usage.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+IMAGE="${SANDPOD_IMAGE:-sandpod}"
+MEM="${SANDPOD_MEM:-4g}"
+CPUS="${SANDPOD_CPUS:-2}"
+HOME_VOLUME="sandpod-agent-home"
+
+PROJECT_DIR="$(pwd)"
+CONTAINER_BASENAME="$(basename "$PROJECT_DIR" | tr -c 'a-zA-Z0-9_.-' '-')"
+CONTAINER_HASH="$(printf '%s' "$PROJECT_DIR" | shasum -a 256 | cut -c1-8)"
+CONTAINER="sandpod-${CONTAINER_BASENAME}-${CONTAINER_HASH}"
+
+usage() {
+  cat <<'EOF'
+sandpod: run AI coding agents inside a hardened Podman sandbox.
+
+Usage: sandpod <command> [args...]
+
+Commands:
+  init            Create a .sandignore in the current project (won't overwrite)
+  build           Build/rebuild the sandbox image from the Containerfile
+  shell           Open an interactive shell in the current project's sandbox
+  run <cmd...>    Run a command in the current project's sandbox (e.g. `sandpod run claude`)
+  remove          Stop and remove the current project's sandbox container
+  list            List all sandpod containers across every project
+  config ls       Show the merged ignore list and what it currently masks
+  help            Show this message
+
+The sandbox container is created on first `run`/`shell` for a project and
+reused after that (state, e.g. anything installed in $HOME, persists across
+sessions). Everything on the ignore list is masked live, on every file
+access, by a FUSE shadow filesystem running inside the container - a file
+created mid-session is masked instantly, exactly like one that already
+existed, no restart needed. Editing the ignore list itself (not just the
+files it matches) does need a restart to take effect - `sandpod` detects
+that automatically and recreates the container on your next `run`/`shell`.
+
+Env vars: SANDPOD_IMAGE (default: sandpod), SANDPOD_MEM (default: 4g),
+SANDPOD_CPUS (default: 2).
+EOF
+}
+
+image_exists() {
+  podman image exists "$IMAGE"
+}
+
+require_image() {
+  if ! image_exists; then
+    echo "sandpod: image '$IMAGE' not found. Run 'sandpod build' first." >&2
+    exit 1
+  fi
+}
+
+# Hash of the merged ignore list content (global.sandignore + project
+# .sandignore, if any). sandpod-init.sh merges these into one rules file
+# ONCE at container start and sandpod-fuse reads them ONCE at its own
+# startup - a running container can't pick up a change to the ignore LIST
+# itself (as opposed to a file merely appearing/disappearing on disk, which
+# the live FUSE shadow handles instantly either way). This hash is compared
+# against a label on the existing container so an edited .sandignore
+# triggers an automatic recreate, the same restart-to-apply behavior
+# claude-container's rp documents for .rp/shadow changes.
+ignore_list_sig() {
+  local content
+  content="$(cat "$REPO_DIR/config/global.sandignore")"
+  if [ -f "$PROJECT_DIR/.sandignore" ]; then
+    content="$content
+$(cat "$PROJECT_DIR/.sandignore")"
+  fi
+  printf '%s' "$content" | shasum -a 256 | cut -c1-16
+}
+
+# Waits for sandpod-init.sh (PID 1, root) to finish setting up the FUSE
+# mount before any `podman exec` tries to use /workspace - `podman run -d`
+# only guarantees the container has started, not that its init script has
+# gotten as far as mounting.
+wait_for_mount() {
+  local i
+  for i in $(seq 1 50); do
+    if podman exec "$CONTAINER" mountpoint -q /workspace 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "sandpod: /workspace did not mount inside 10s - check 'podman logs $CONTAINER'" >&2
+  return 1
+}
+
+ensure_container() {
+  require_image
+
+  local ignore_sig
+  ignore_sig="$(ignore_list_sig)"
+
+  if podman container exists "$CONTAINER"; then
+    local existing_sig
+    existing_sig="$(podman inspect -f '{{index .Config.Labels "sandpod.ignore-sig"}}' "$CONTAINER" 2>/dev/null || true)"
+    if [ "$existing_sig" = "$ignore_sig" ]; then
+      if [ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
+        podman start "$CONTAINER" >/dev/null
+        wait_for_mount
+      fi
+      return 0
+    fi
+    echo "sandpod: ignore list changed - recreating sandbox container for $PROJECT_DIR" >&2
+    podman rm -f "$CONTAINER" >/dev/null
+  else
+    echo "sandpod: creating sandbox container for $PROJECT_DIR" >&2
+  fi
+
+  # Container starts as root (PID 1 = sandpod-init.sh, the image's default
+  # CMD) with CAP_SYS_ADMIN and /dev/fuse - needed to set up the tmpfs/FUSE
+  # boundary. The project directory is bind-mounted straight into the
+  # image's pre-restricted /var/lib/sandpod/real/workspace-real (0700
+  # parent, baked in at build time - see Containerfile), not directly at
+  # /workspace: /workspace is the FUSE mount sandpod-fuse creates once
+  # sandpod-init.sh execs it. The actual agent/shell session (cmd_run/
+  # cmd_shell) execs afterward as the unprivileged `sandbox` user, which
+  # gets none of this container's capabilities.
+  #
+  # DAC_OVERRIDE/FOWNER/CHOWN alongside SYS_ADMIN: with --cap-drop=ALL,
+  # root (uid 0) inside the container is NOT automatically able to bypass
+  # file permission checks - that bypass is specifically CAP_DAC_OVERRIDE,
+  # not a uid-0 default. sync_claude_config's root-run mkdir/rm/chmod
+  # bookkeeping on the persistent home volume needs it to reliably manage
+  # files regardless of what owns them from a previous sync (confirmed by
+  # testing: without these, root itself got "Permission denied" on content
+  # left behind by an interrupted prior sync).
+  podman run -d --name "$CONTAINER" \
+    --label sandpod.tool=true \
+    --label "sandpod.project=$PROJECT_DIR" \
+    --label "sandpod.ignore-sig=$ignore_sig" \
+    -v "$PROJECT_DIR:/var/lib/sandpod/real/workspace-real" \
+    -v "$HOME_VOLUME:/home/sandbox:z" \
+    --cap-drop=ALL \
+    --cap-add SYS_ADMIN \
+    --cap-add DAC_OVERRIDE \
+    --cap-add FOWNER \
+    --cap-add CHOWN \
+    --device /dev/fuse \
+    --security-opt no-new-privileges \
+    --pids-limit=1024 \
+    --memory="$MEM" \
+    --cpus="$CPUS" \
+    "$IMAGE" >/dev/null
+
+  wait_for_mount
+}
+
+# Copies a curated, known-safe slice of the host's ~/.claude (skills,
+# plugins, commands, agents, CLAUDE.md, settings, top-level *.sh scripts
+# like disconnect_vpn.sh) into the sandbox's own ~/.claude via `podman cp`,
+# every time - not a mount. ~/.claude also holds a lot of sensitive/
+# cross-project state (session transcripts, shell snapshots, history) that
+# has no reason to ever be visible to a sandboxed agent, so this is an
+# explicit allowlist, not "mount everything and mask the bad parts".
+sync_claude_config() {
+  local host_claude="$HOME/.claude"
+  [ -d "$host_claude" ] || return 0
+  # Runs as root (the container's default exec user): needs to be able to
+  # remove/recreate these paths regardless of what owns them from a
+  # previous sync, and podman cp's ownership behavior on the way in isn't
+  # guaranteed to match "sandbox" anyway - readability is all that matters
+  # for these reference-only files, and sandbox can read anything
+  # world-readable regardless of literal ownership.
+  podman exec "$CONTAINER" mkdir -p /home/sandbox/.claude
+
+  local name
+  for name in skills plugins commands agents; do
+    if [ -d "$host_claude/$name" ]; then
+      podman exec "$CONTAINER" rm -rf "/home/sandbox/.claude/$name"
+      podman cp "$host_claude/$name" "$CONTAINER:/home/sandbox/.claude/$name" >/dev/null
+    fi
+  done
+
+  for name in CLAUDE.md settings.json settings.local.json; do
+    if [ -f "$host_claude/$name" ]; then
+      podman cp "$host_claude/$name" "$CONTAINER:/home/sandbox/.claude/$name" >/dev/null
+    fi
+  done
+
+  shopt -s nullglob
+  local script
+  for script in "$host_claude"/*.sh; do
+    podman cp "$script" "$CONTAINER:/home/sandbox/.claude/$(basename "$script")" >/dev/null
+  done
+  shopt -u nullglob
+  podman exec "$CONTAINER" chmod -R a+rX /home/sandbox/.claude
+}
+
+cmd_init() {
+  local target="$PROJECT_DIR/.sandignore"
+  if [ -f "$target" ] && [ "${1:-}" != "--force" ]; then
+    echo "sandpod: $target already exists (use --force to overwrite)" >&2
+    exit 1
+  fi
+  cat > "$target" <<'EOF'
+# sandpod ignore list for this project.
+#
+# Paths listed here are hidden from the sandbox, live: the container never
+# sees your real content there (reads as absent, "ENOENT", until the
+# container itself writes something), even if you create the file after
+# the sandbox is already running. This is merged with sandpod's built-in
+# config/global.sandignore (already covers .ssh/, .aws/, .env,
+# credentials.json, *.pem, etc.) - you don't need to repeat those here,
+# this file is for anything specific to this project. Editing this file
+# requires a container restart to take effect (automatic on your next
+# `sandpod run`/`shell` - it detects the change and recreates).
+#
+# Format: a strict subset of .gitignore syntax.
+#   - one pattern per line; "#" starts a comment; blank lines ignored
+#   - *, ?, [abc] work as in gitignore; ** matches any number of path parts
+#   - a bare name with no "/" matches at any depth, e.g. "secrets.json"
+#     matches ./secrets.json and ./any/nested/secrets.json
+#   - a leading "/", or any "/" not at the end, anchors to the project root
+#   - a trailing "/" restricts the pattern to directories
+#   - negation ("!pattern") is NOT supported
+#
+# Examples:
+# secrets.json
+# terraform.tfstate
+# config/local.yml
+# .env.production
+
+EOF
+  echo "sandpod: created $target"
+}
+
+cmd_build() {
+  podman build -t "$IMAGE" "$REPO_DIR"
+}
+
+cmd_run() {
+  if [ "$#" -eq 0 ]; then
+    echo "sandpod: usage: sandpod run <command...> (or use 'sandpod shell')" >&2
+    exit 1
+  fi
+  ensure_container
+  sync_claude_config
+  exec podman exec -it -u sandbox -w /workspace "$CONTAINER" /usr/local/bin/sandpod-activate-node.sh "$@"
+}
+
+cmd_shell() {
+  ensure_container
+  sync_claude_config
+  exec podman exec -it -u sandbox -w /workspace "$CONTAINER" /usr/local/bin/sandpod-activate-node.sh bash
+}
+
+cmd_remove() {
+  if podman container exists "$CONTAINER"; then
+    podman rm -f "$CONTAINER" >/dev/null
+    echo "sandpod: removed sandbox container for $PROJECT_DIR"
+  else
+    echo "sandpod: no sandbox container for $PROJECT_DIR"
+  fi
+}
+
+cmd_list() {
+  # podman ps --format flattens .Labels to a comma-joined string (not a map
+  # like Docker's), so `index .Labels ...` doesn't work there - use
+  # `inspect` per container instead, where .Config.Labels is a real map.
+  local ids id name status project
+  ids="$(podman ps -a --filter label=sandpod.tool=true -q)"
+  if [ -z "$ids" ]; then
+    echo "sandpod: no sandbox containers"
+    return 0
+  fi
+  printf '%-34s %-10s %s\n' "NAME" "STATUS" "PROJECT"
+  while IFS= read -r id || [ -n "$id" ]; do
+    name="$(podman inspect -f '{{.Name}}' "$id" | sed 's#^/##')"
+    status="$(podman inspect -f '{{.State.Status}}' "$id")"
+    project="$(podman inspect -f '{{index .Config.Labels "sandpod.project"}}' "$id")"
+    printf '%-34s %-10s %s\n' "$name" "$status" "$project"
+  done <<< "$ids"
+}
+
+cmd_config_ls() {
+  echo "== Global (${REPO_DIR}/config/global.sandignore) =="
+  cat "$REPO_DIR/config/global.sandignore"
+  echo
+  if [ -f "$PROJECT_DIR/.sandignore" ]; then
+    echo "== Project-local (${PROJECT_DIR}/.sandignore) =="
+    cat "$PROJECT_DIR/.sandignore"
+  else
+    echo "== Project-local: none (run 'sandpod init' to create one) =="
+  fi
+  echo
+  if podman container exists "$CONTAINER" 2>/dev/null; then
+    echo "== Patterns currently loaded in the sandbox for $PROJECT_DIR =="
+    podman logs "$CONTAINER" 2>&1 | grep -A 1000 "mounted host=" | grep "  pattern: " | sed 's/^.*pattern: /  /' || \
+      echo "(no sandpod-fuse mount log found - container may need 'sandpod remove' + recreate)"
+  else
+    echo "== No sandbox container yet for $PROJECT_DIR =="
+    echo "(patterns take effect once you run 'sandpod shell' or 'sandpod run <cmd>')"
+  fi
+}
+
+case "${1:-help}" in
+  init) shift; cmd_init "$@" ;;
+  build) shift; cmd_build "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  shell) cmd_shell ;;
+  remove|rm) cmd_remove ;;
+  list|ls) cmd_list ;;
+  config)
+    shift
+    case "${1:-}" in
+      ls) cmd_config_ls ;;
+      *) echo "sandpod: usage: sandpod config ls" >&2; exit 1 ;;
+    esac
+    ;;
+  help|--help|-h) usage ;;
+  *) echo "sandpod: unknown command '$1'" >&2; usage; exit 1 ;;
+esac
