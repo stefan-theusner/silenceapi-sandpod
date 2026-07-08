@@ -63,6 +63,7 @@ Commands:
   build           Build/rebuild the sandbox image from the Containerfile
   shell           Open an interactive shell in the current project's sandbox
   run <cmd...>    Run a command in the current project's sandbox (e.g. `sandpod run claude`)
+  launch <cmd...> Alias for `run` (e.g. `sandpod launch codex`)
   remove          Stop and remove the current project's sandbox container
   list            List all sandpod containers across every project
   config ls       Show the merged ignore list and what it currently masks
@@ -274,7 +275,7 @@ cmd_build() {
 
 cmd_run() {
   if [ "$#" -eq 0 ]; then
-    echo "sandpod: usage: sandpod run <command...> (or use 'sandpod shell')" >&2
+    echo "sandpod: usage: sandpod run <command...> (or 'sandpod launch <command...>' / 'sandpod shell')" >&2
     exit 1
   fi
   ensure_container
@@ -333,14 +334,14 @@ cmd_config_ls() {
       echo "(no sandpod-fuse mount log found - container may need 'sandpod remove' + recreate)"
   else
     echo "== No sandbox container yet for $PROJECT_DIR =="
-    echo "(patterns take effect once you run 'sandpod shell' or 'sandpod run <cmd>')"
+    echo "(patterns take effect once you run 'sandpod shell' or 'sandpod run <cmd>' / 'sandpod launch <cmd>')"
   fi
 }
 
 case "${1:-help}" in
   init) shift; cmd_init "$@" ;;
   build) shift; cmd_build "$@" ;;
-  run) shift; cmd_run "$@" ;;
+  run|launch) shift; cmd_run "$@" ;;
   shell) cmd_shell ;;
   remove|rm) cmd_remove ;;
   list|ls) cmd_list ;;
