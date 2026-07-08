@@ -3,6 +3,20 @@
 Run AI coding agents (Claude Code, Codex, etc.) inside a hardened, rootless
 Podman sandbox on macOS.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/stefan-theusner/silenceapi-sandpod/main/install.sh | bash
+```
+
+This clones sandpod to `~/.sandpod`, installs Podman via Homebrew if it's
+missing, sets up a podman machine if you don't have one, builds the sandbox
+image, and links the `sandpod` command into `/usr/local/bin` (or prints a
+`PATH` line to add yourself if that's not writable). Safe to re-run later —
+it updates the existing clone and rebuilds instead of reinstalling from
+scratch. See "Prerequisites" below if you'd rather do each step by hand, or
+`install.sh` itself for exactly what it runs.
+
 ## How it works
 
 The sandbox bind-mounts your real project directory read-write, directly.
